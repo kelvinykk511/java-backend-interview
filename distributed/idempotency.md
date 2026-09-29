@@ -40,3 +40,7 @@
 ## 小練習
 
 提現回調與用戶點「重試提交」可能撞在一起：`Idempotency-Key` 和鏈上 `txHash` 各解決哪一種重複？能不能只用其中一個？
+
+## 關聯
+
+- [Transactional Outbox](transactional-outbox.md)
