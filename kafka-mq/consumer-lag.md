@@ -2,41 +2,52 @@
 
 ## 面試問題
 
-Kafka Consumer Lag 是什麼？怎麼算？線上 lag 一直漲，你會怎麼排查？
+Kafka Consumer Lag 是什麼？怎麼算？線上 lag 一直漲，你會怎麼排查與緩解？
 
 ## 答法
 
 **定義**
 
-- Lag ≈ 該 partition **最新 log end offset** − 該 consumer group **已提交的 committed offset**。
-- 表示「還有多少條還沒被這個 group 確認處理完」，不是「還在 JVM 記憶體裡的條數」。
+- 每個 partition：`lag ≈ log end offset（high watermark／LEO）− 該 group 的 committed offset（或 consumer 當前 position，視你看的指標）`。
+- 語意：「這個 group 在該 partition 上還落後 tip 多少」——**不是**「消息丟了」，也不是 JVM 裡堆積的條數。
 
-**怎麼看**
+**怎麼觀察**
 
-- `kafka-consumer-groups.sh --describe`、監控系統的 `records-lag` / max lag。
-- 看 **per-partition**，不要只看 group 總和（可能某一 partition 卡住、其他正常）。
+- `kafka-consumer-groups.sh --describe`：看 CURRENT-OFFSET、LOG-END-OFFSET、LAG（**按 partition**）。
+- 監控：`records-lag` / `records-lag-max`；盯 per-partition，別只看 group 總和（可能單 partition 卡住）。
 
-**常見原因（面試愛問）**
+**常見原因**
 
-1. **消費慢**：單條處理重（DB、RPC、大 JSON）；batch 太大或太小。
-2. **卡住**：下游超時、死鎖、線程池滿、某條 poison message 反覆失敗。
-3. **分配不均**：key 熱點 → 某一 partition lag 獨高。
-4. **rebalance 頻繁**：成員進出、`session.timeout` / `max.poll.interval` 配錯 → 反覆停消費。
-5. **生產突增**：流量尖峰，消費吞吐跟不上。
+1. **處理慢**：單條重（DB／RPC）、批次不當；STW GC 拖長 poll 間隔。
+2. **Rebalance 抖動**：成員進出、`session.timeout` / `max.poll.interval.ms` 配錯 → 反覆停消費。
+3. **並行度不夠**：consumer 數 > partition 數也沒用；常是 **partition < 有效消費者** 或熱點 key 打到少數 partition。
+4. **卡住**：下游超時、死鎖、poison message 反覆失敗、線程池滿。
+5. **生產突增**：吞吐跟不上。
 
-**怎麼壓（對症）**
+**緩解（對症）**
 
-- 加 consumer 實例（partition 數夠才有用）；或先加 partition 再擴 consumer。
-- 業務異步化 / 批量寫庫；失敗進死信，別堵主循環。
-- 熱點 key 打散；調 `max.poll.records`、下游超時與併發。
-- 先確認是「真處理慢」還是「沒 commit」——後者 lag 數字也會騙人。
+- **水平擴 consumer**（上限 ≈ partition 數）；不夠就先加 partition 再擴。
+- 異步／批量處理時想清楚 **commit 語意**（先處理再 commit vs 先 commit 可能丟）。
+- 調大 `max.poll.interval.ms` **只有**在理解風險時才做：間隔太長 → 卡住的 member 更晚被踢，rebalance／卡死更久。
+- 熱點 partition：打散 key、業務削峰；失敗進死信，別堵 poll 循環。
+- `max.poll.records` 加大前先確認單次批次處理能力，否則更容易觸發 max.poll.interval → 被踢出組。
+
+**面試一句話**：Lag = tip − committed；先分清「真慢／沒 commit／rebalance／熱點」，再擴並行或改處理，別把 lag 當丟消息。
 
 ## 常見追問 / 陷阱
 
-「Lag = 0 就代表剛好一次、沒丟消息？」
+「Lag ≠ 丟消息？」
 
-→ 否。Lag 只反映 **committed offset 跟上 tip 的距離**。先 commit 再處理可能 **丟**；至少一次仍可能 **重複**。業務冪等跟 lag 監控是兩件事。
+→ 對。Lag 只反映 **committed（或 position）離 tip 的距離**。消息仍在 log 裡（未超 retention）。丟／重複取決於 **何時 commit** 與業務冪等。
+
+「committed offset vs in-flight」
+
+→ 已 commit 之前的 in-flight 若進程掛了會重投（at-least-once）。Lag 看 committed 時，可能低估「手頭還沒做完」的量。
+
+「狂加 `max.poll.records`」
+
+→ 單次 poll 太多 → 處理超時 → 超過 `max.poll.interval` → 被踢 → rebalance → lag 更糟。容量沒跟上別只調大。
 
 ## 小練習
 
-某 partition lag 十萬、其他幾乎為 0——你第一個懷疑什麼？會查哪三個指標？
+某 partition lag 十萬、其他幾乎為 0——你第一個懷疑什麼？會查哪三個指標？若把 `max.poll.interval.ms` 調到很大，短期 lag 看似穩了，長期可能藏什麼問題？
