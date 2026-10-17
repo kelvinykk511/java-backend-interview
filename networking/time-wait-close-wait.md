@@ -28,6 +28,11 @@
 
 「為什麼 TIME_WAIT 是 2MSL 不是 1MSL？」→ 一來一回：自己的 ACK 可能要 1MSL 才到/丟失，對方重發的 FIN 再 1MSL 回來。陷阱：說「TIME_WAIT 在服務端很多就調 `tcp_tw_reuse`」——它主要對**發起連接**的一方生效，服務端應該先想為什麼是自己在主動關。
 
+## See also
+
+- [TCP TIME_WAIT 調優](time-wait-tuning.md)（端口耗盡 QPS 估算、`tcp_tw_reuse`、Nginx upstream keepalive）
+- [HTTP Keep-Alive 與連線池](http-keepalive-connection-pool.md)
+
 ## 小練習
 
 行情網關調用內部報價服務，每次請求 new 一個 HttpClient 用完 close，高峰報 `Cannot assign requested address`；另一台機器 CLOSE_WAIT 持續上漲到幾萬。兩台各是什麼問題、各先改哪裡？

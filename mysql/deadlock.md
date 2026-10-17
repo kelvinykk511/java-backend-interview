@@ -35,6 +35,10 @@ InnoDB 為什麼會死鎖？發生後資料庫怎麼辦？應用要怎麼寫才�
 
 → 不會。RC 少用 gap lock，**某些**死鎖會變少，但 row lock 互等照樣死鎖。治本仍是加鎖順序 + 短事務 + 好索引。
 
+## See also
+
+- [MySQL 死鎖排查實戰](deadlock-troubleshooting.md)（線上 1213 逐步排查、gap lock + INSERT 互卡、CEX 熱點帳戶）
+
 ## 小練習
 
 轉帳：扣 A 加 B。兩個併發請求一個 A→B、一個 B→A，為什麼容易死鎖？程式怎麼改加鎖順序？
