@@ -21,3 +21,17 @@ Spring 單例 Bean 之間互相注入為什麼有時能起來、有時啟動直�
 ## 小練習
 
 A、B 互相 `@Autowired` 構造器注入啟動失敗；改成欄位注入後能起來。向面試官你會怎麼解釋差異，以及你更傾向哪種修法？
+
+## 深入：三級緩存（2026-10-21 refresh）
+
+**面試題**：Spring 點樣解決單例 setter/字段注入嘅循環依賴？點解要三級緩存，二級唔得？
+
+- 一級 `singletonObjects`：完整 Bean。
+- 二級 `earlySingletonObjects`：已暴露嘅早期引用（可能已經係代理）。
+- 三級 `singletonFactories`：`ObjectFactory`，調 `getEarlyBeanReference()`——**有 AOP 就喺呢度提早生成代理**。
+- 流程（A↔B）：A 實例化（構造完，屬性未填）→ 放 A 嘅 factory 入三級 → 填 A 屬性要 B → 建 B → B 要 A → 三級 factory 攞 A 早期引用（必要時係代理）放二級 → B 完成 → A 完成，放一級。
+- **點解要三級**：正常 AOP 代理喺初始化**最後**（`postProcessAfterInitialization`）先生成；三級 factory 令到「只有真係出現循環依賴」先提早生成代理，冇循環就保持正常時機。只用二級就要每個 Bean 一實例化就生成代理，破壞生命周期設計。
+- **解決唔到**：構造器注入（未實例化，冇早期引用）、prototype、`@Async` 類（代理由另一個 BeanPostProcessor 後置生成，早期引用≠最終對象 → `BeanCurrentlyInCreationException`「has been injected into other beans in its raw version」）。
+- **Spring Boot 2.6+ 預設禁止循環依賴**（`spring.main.allow-circular-references=false`），啟動直接報錯。
+
+**陷阱**：解法唔係開返 allow-circular-references，而係改設計——抽公共邏輯去第三個 Bean、用事件解耦、或者 `@Lazy` 注入代理（治標）。
