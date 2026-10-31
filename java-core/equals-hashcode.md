@@ -24,3 +24,7 @@
 「兩個物件 `hashCode` 一樣，放進 HashMap 會怎樣？」
 
 → 進同一桶，再用 `equals` 區分；Java 8+ 鏈太長可能轉紅黑樹。碰撞多只影響效能，不該破壞正確性——正確性靠 equals/hashCode 契約。
+
+## 實戰例子：BigDecimal 做 key
+
+`BigDecimal` 嘅 `equals`/`hashCode` 包含 scale，`1.0` 同 `1.00` 唔相等 → 做 HashMap key 會「查唔到同價」。詳見 [BigDecimal 與金額計算陷阱](./bigdecimal-money.md)。
