@@ -38,3 +38,11 @@
 ## 一句話
 
 interrupt 係協作式：設標誌 + 阻塞方法拋異常；catch 到要恢復標誌或者退出，唔好食咗佢。
+
+---
+
+## 補充（2026-11-02 drill）：BIO Socket read 唔響應中斷
+
+- 傳統 `Socket.getInputStream().read()` 唔係可中斷 I/O，`interrupt()` 只設標誌，線程照卡。
+- 解法：`setSoTimeout` + loop 檢查中斷標誌；停機時另一線程 `socket.close()`（read 拋 `SocketException`）；或改用 NIO `SocketChannel`（`ClosedByInterruptException`）。
+- JDK 21 虛擬線程例外：阻塞喺 Socket I/O 時被 interrupt 會關 socket 拋 `SocketException`。
