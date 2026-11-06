@@ -22,6 +22,6 @@
 
 ## 追問 / 陷阱
 
-- **「Humongous 分配頻繁」點睇**：GC log 見 `G1 Humongous Allocation` 觸發 GC。典型係一次性讀大 JSON / 大 `byte[]` / 大 List。修：分批 / 流式處理；或者調大 `-XX:G1HeapRegionSize`（1M~32M，2 嘅冪）令佢唔再算 humongous。
+- **「Humongous 分配頻繁」點睇**：GC log 見 `G1 Humongous Allocation` 觸發 GC。典型係一次性讀大 JSON / 大 `byte[]` / 大 List。修：**分批／流式處理，唔造大對象**。調大 `-XX:G1HeapRegionSize`（1M~32M，2 嘅冪）只對「半區以下」有效——**Region 最大 32MB，半區=16MB，所以 >16MB 永遠係 Humongous**，加大 Region **救唔到** 20MB `readAllBytes`；仲可能令 Young 區變粗、GC 停頓特性改變。有時會伴隨 `to-space exhausted`（連續 Region／疏散空間唔夠）。
 - **TLAB 浪費**：線程好多（例如幾千個平台線程）每個都揸住一塊 TLAB，Eden 碎片化、Young GC 變頻。
 - 指針碰撞要堆**規整**（有壓縮嘅收集器）；CMS 呢類標記-清除要用**空閒列表**。
