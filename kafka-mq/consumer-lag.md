@@ -51,3 +51,54 @@ Kafka Consumer Lag 是什麼？怎麼算？線上 lag 一直漲，你會怎麼�
 ## 小練習
 
 某 partition lag 十萬、其他幾乎為 0——你第一個懷疑什麼？會查哪三個指標？若把 `max.poll.interval.ms` 調到很大，短期 lag 看似穩了，長期可能藏什麼問題？
+
+
+---
+
+## 深入（2026-11-11）：lag 持續漲 + 頻繁 rebalance 點排查
+
+### 面試問題
+
+線上某個消費組 lag 持續上漲，監控同時見到頻繁 rebalance。你點分「真係處理唔切」同「被自己踢出組」？`session.timeout.ms`、`max.poll.interval.ms`、`group.instance.id` 各解什麼問題？亂加大 poll interval 有什麼代價？
+
+### 答法
+
+**先分流，唔好一開始就加 partition／加實例**
+
+- Lag = tip − committed（按 **partition** 睇，唔好只看 group 總和）。
+- 同時睇：**rebalance 次數**、成員 join／leave、係邊個 member 被踢、`records-lag` 係全部 partition 一齊升定得一兩條卡死。
+- 兩類主因：
+  1. **吞吐真跟唔上**：處理慢、熱點 key、並行度不夠（有效 consumer ≤ partition）。呢種即使冇 rebalance，lag 都會斜向上。
+  2. **Rebalance 循環**：消費窗口不停停低，lag 被「停消費」推高，再觸發更多超時踢人。
+
+**兩個超時唔好混（0.10.1 之後 heartbeat 喺獨立線程）**
+
+| 參數 | 睇什麼 | 超時後果 |
+|------|--------|----------|
+| `session.timeout.ms`（配 `heartbeat.interval.ms`） | 進程仲唔喺度（心跳） | 當死機／斷網踢走 |
+| `max.poll.interval.ms` | 兩次 `poll()` 之間最長間隔 | 活住但批次處理太久／堵咗 poll 循環 → 一樣被踢 |
+
+面試常考：GC／下游慢／`max.poll.records` 太大，心跳其實仲喺跳，但 poll 間隔爆咗 → 日誌係被踢出組，唔係 session 心跳失敗。
+
+**同 rebalance 的惡性循環**
+
+- 被踢 → 觸發 rebalance（Eager 會撤銷全部；Cooperative 只撤必須搬走的，見 [consumer-rebalance](consumer-rebalance.md)）→ 窗口內冇人消費 → lag 衝高。
+- 滾動發佈冇靜態成員：每次下線都當「成員離開」。
+- 處理越慢越容易爆 `max.poll.interval` → 越 rebalance 越慢。
+
+**對症，而唔係只調大超時**
+
+- 縮細 `max.poll.records`、加快處理、毒消息進死信，**保證 poll 循環唔被堵**。
+- 滾動發佈：`group.instance.id`（靜態成員）+ cooperative sticky；協調器會等，唔即刻當新人。
+- 並行度：consumer 數 ≤ partition 數；熱點先打散 key。
+- **亂加大 `max.poll.interval.ms`**：短期 rebalance 停、lag 看似穩，但卡住／死鎖／毒消息嘅 member **更耐先被踢**，對應 partition 可以靜默落後好耐。呢個係常見假好轉。
+
+**再加一個語意陷阱**
+
+- 指標 lag 睇的是 **committed**。若先 commit 再異步處理，lag 可以係 0，但業務其實仲有 in-flight；進程掛了可能丟。Lag 低 ≠ 業務追上，更 ≠ 冇重複。
+
+### 追問／陷阱
+
+- 「加多幾倍 `max.poll.interval.ms` 就搞得掂？」→ 只係延後踢人；根因係批次太大或 poll 被堵。卡住嘅分區會更遲先暴露。
+- 「lag 飆即係消息丟了？」→ 唔係；消息仲喺 log（未超 retention）。丟／重複睇 commit 時機同冪等。
+- 只擴 consumer 但 partition 少過實例：多餘實例空轉，幫唔到 lag。

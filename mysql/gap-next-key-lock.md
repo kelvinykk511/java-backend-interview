@@ -49,3 +49,50 @@ RR 下防幻讀的主力是 **Next-Key**：範圍／部分等值的**當前讀**
 ## 小練習
 
 `SELECT … FOR UPDATE` 掃 `status=1`（非唯一二級索引），事務 A、B 同時再各插一筆 `status=1` 但主鍵不同。畫一下誰鎖了哪個 gap、Insert Intention 怎麼互等。
+
+
+---
+
+## 深入（2026-11-11）：唯一索引「唔存在」嘅 FOR UPDATE，同「先查再插」陷阱
+
+### 面試問題
+
+RR 下用「先 `SELECT … FOR UPDATE` 再決定是否 `INSERT`」做冪等（例如唯一鍵 `client_oid`）。若呢行**仲未存在**，其實鎖了什麼？兩個事務用**同一個**新 oid、同用**兩個不同**嘅新 oid，分別會點？改 RC 呢？
+
+### 答法
+
+**先溫三種鎖同「何時先有鎖」**
+
+- Record／Gap／Next-Key 嘅定義見上文。普通 `SELECT` 喺 RR 係**快照讀**，唔加呢啲鎖；`FOR UPDATE`／`UPDATE`／`DELETE` 先係**當前讀**。
+- **唯一索引等值且命中**：常退化成 **Record Lock**，唔鎖 gap。
+- **唯一索引等值但唔命中**（行仲未在）：會鎖住「呢個鍵應該插入嘅 **gap**」（鄰近已有記錄之間的空隙，極端時空表／稀疏區間會去到 **supremum** 一類虛擬記錄，等於鎖住好大一段）。目的係擋住別人插入呢條「幻影行」。
+
+**同一個新 oid**
+
+- T1 `SELECT … FOR UPDATE` 唔中 → 持有該 gap；T2 用同一個 oid 再 `FOR UPDATE` 或 `INSERT`，要喺同一 gap 拿鎖／Insert Intention → **等 T1**。
+- T1 再 `INSERT` 並提交後，T2 醒來可能見到行已在，或 `INSERT` 撞唯一鍵（Duplicate）。呢條路徑比較多係「串行 + 重複鍵」，唔一定死鎖；若兩邊仲持有其他鎖、順序相反，先至容易死鎖。
+
+**兩個不同嘅新 oid（面試加分）**
+
+- 若兩個鍵落喺**同一條 gap**（中間冇其他已有記錄），RR 下 T1 為咗「唔存在嘅 A」鎖咗成段 gap，T2 插 B 都要等——**主鍵／oid 根本唔撞車，都會互擋**。
+- 空表、冷區、UUID 剛好相鄰，都可能把大量「唔相關」的插入打進同一 gap → 併發崩潰，甚至同 Insert Intention 形成**等待環死鎖**。
+- 口條：Gap 鎖嘅粒度係**空隙**，唔係「只鎖你查嘅嗰個值」。
+
+**RC 差在邊**
+
+- RC 一般**唔持有 gap lock**（插入時仍有 Insert Intention／唯一約束檢查）。
+- 兩個事務用不同 oid：多數唔會因「同一空隙」互相擋。
+- 同一個新 oid：兩邊都可以見到「未存在」，再搶 `INSERT`，一個成功、一個 Duplicate——要用唯一索引兜底，而唔係靠 RR 的 gap 做業務互斥。
+- 改 RC **減 gap 死鎖**，但唔等於冇行鎖死鎖，亦唔再靠 next-key 擋當前讀幻讀。
+
+**業務建議（CEX 下單／充值 txid 好常見）**
+
+- 冪等優先：**唯一索引 + 直接 INSERT**，撞鍵當「已受理」，唔好用「先 FOR UPDATE 再插」當並發鎖。
+- 真要鎖已有行，先確保等值命中唯一索引；範圍／非唯一二級索引嘅當前讀，鎖範圍可以好大。
+- 讀 `SHOW ENGINE INNODB STATUS`／`performance_schema.data_locks` 時，留意 `GAP`／`INSERT INTENTION`／`supremum`，唔好只揾 record 對撞。
+
+### 追問／陷阱
+
+- 「唯一索引就一定冇 gap？」→ 只係**等值命中**時常退化；**唔命中**同範圍掃描仍然有 gap／next-key。
+- 「兩個 INSERT 主鍵都唔同，點會死鎖？」→ 同一 gap 上的 gap／Insert Intention 對撞就夠，見上文 Insert Intention。
+- 「改 RC 之後仲有死鎖就怪了？」→ 行鎖順序、唯一鍵衝突等待，RC 一樣可以死鎖；只係少咗 gap 呢一類。

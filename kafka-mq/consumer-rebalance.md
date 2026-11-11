@@ -50,3 +50,12 @@ Kafka Consumer Group 什麼時候會 rebalance？Eager vs Cooperative 差在哪�
 ## 小練習
 
 三副本消費者滾動發布，每次重啟 lag 衝一波再回落。你會先開 `group.instance.id`、改 cooperative，還是先加大 `max.poll.interval.ms`？各解哪類問題？
+
+
+---
+
+## 深入（2026-11-11）：同 lag 聯查時多講一句
+
+排查「lag 漲＋頻繁 rebalance」時，優先分清踢人原因係 **session（心跳）** 定 **`max.poll.interval.ms`（poll 被堵／批次太慢）**，再決定用靜態成員減滾動發佈震盪，定係先修處理循環。細節同假好轉（亂加大 interval）見 [consumer-lag](consumer-lag.md) 2026-11-11 節。
+
+靜態成員唔係萬能：實例永久下線後，協調器仍會等到 timeout 先把分區轉走，故障轉移會變慢——要權衡「發佈少抖」同「掛咗更遲切走」。
