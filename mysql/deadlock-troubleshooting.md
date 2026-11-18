@@ -60,3 +60,39 @@
 - [InnoDB 死鎖：成因、檢測與避開](deadlock.md)
 - [Gap / Next-Key 鎖](gap-next-key-lock.md)
 - [RC vs RR](rc-vs-rr.md)
+
+---
+
+## 深入（2026-11-18）：二級索引同主鍵加鎖順序（類型 c）
+
+### 面試可以點追
+
+訂單表一個事務用 `SELECT ... FROM orders WHERE user_id=? FOR UPDATE`（二級索引）再改狀態；另一個按主鍵 `UPDATE orders SET ... WHERE id=?`，有時仲會改到帶索引嘅列。同一行或相鄰幾行都會偶發 1213。點解？點從 `INNODB STATUS` 證實？改 RC 係咪就冇？
+
+### 答法
+
+**點解會成環**
+
+- InnoDB 行鎖掛喺**索引記錄**上面。同一行經唔同索引進去，加鎖順序可以相反。
+- 事務 A：`WHERE user_id=?` 當前讀，通常**先鎖二級索引記錄**，再回表鎖**聚簇索引（主鍵行）**。
+- 事務 B：`WHERE id=?` 嘅 `UPDATE` **先鎖主鍵行**；若修改咗二級索引列（或要維護該二級索引），再去鎖／刪舊、插新二級記錄。
+- 時序一對上：A 持有 `idx_user_id`、等 PRIMARY；B 持有 PRIMARY、等 `idx_user_id` → 環等待 → 1213。兩個事務處理同一個 user 下面多行、一個走二級一個走主鍵但擴鎖順序相反，同樣會中。
+- 注意：B 如果只改非索引列，可能只鎖主鍵、唔再去搶二級鎖，噉同一行多數係 **1205 鎖等待**而唔係死鎖。死鎖通常要「兩邊都要對方手上嗰把索引鎖」。
+
+**點證實**
+
+- `SHOW ENGINE INNODB STATUS\G` → `LATEST DETECTED DEADLOCK`（只留最近一次）。兩邊各自睇 **HOLDS** / **WAITING**、**index 名**（`PRIMARY` vs `idx_user_id`）、`lock_mode`（X、`rec but not gap`、gap、insert intention）。
+- `WE ROLL BACK TRANSACTION (n)`：InnoDB 犧牲 undo 較細嗰邊。
+- 長期開 `innodb_print_all_deadlocks=ON` 寫 error log。8.0 用 `performance_schema.data_locks` / `data_lock_waits` 睇**當前**等待；死鎖一經回滾，現場可能已經散。
+
+**點修**
+
+- 雙方都改做**同一條加鎖路徑**：先按主鍵集合 `SELECT ... WHERE id IN (...) ORDER BY id FOR UPDATE`，再更新。跨帳戶就按 `account_id`／`id` **由細到大**排完先鎖。
+- `WHERE` 必須走索引；事務內唔好做 HTTP／RPC；應用對 1213 **由事務開頭**有限次重試（已經成個 rollback）。
+- 熱點行（手續費帳戶、熱門 uid）用排隊串行或分桶，減少並發搶同一組索引記錄。
+
+### 追問／陷阱
+
+- **改 RC 就唔會死鎖？** 唔會。RC 減少 gap lock，類型 (b) 會少；呢類「主鍵 vs 二級」**行鎖互等**照樣發生。治本仍然係固定加鎖順序 + 短事務 + 好索引。
+- **重試只重跑最後一條 `UPDATE`**：錯。1213 已回滾成個事務，只重最後一句會漏咗前面已撤銷嘅改動。
+- **關 `innodb_deadlock_detect`**：熱點下行死鎖檢測本身可以好食 CPU，有人會關並調細 `innodb_lock_wait_timeout` 變成 1205 兜底。呢個只係減輕檢測成本，唔係根治；監控要把 1213 同 1205 分開告警。
