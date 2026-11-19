@@ -45,3 +45,43 @@
 
 - [熱 key / 緩存重建擊穿](hot-key-rebuild-stampede.md)
 - [過期與淘汰](expiration-eviction.md)
+
+---
+
+## 深入（2026-11-19）：orderbook／持倉大 Hash，HGETALL + DEL 重建
+
+### 面試可以點追
+
+行情把成個交易對 orderbook 塞進一個 Redis Hash（幾萬 field），開盤 `HGETALL` 期間 RT 飆高，甚至主從延遲、故障切換。對帳又會 `HGETALL` 再 `DEL` 重建用戶持倉 Hash。Big key 同 hot key 有咩分別？點定位、點拆、點刪？
+
+### 答法
+
+**先分清**
+
+- **Big key**：單個 key **大**（value 大或元素極多），一次 `HGETALL`／`DEL` 就貴，阻塞單線程、打滿網卡、拖慢複製同 slot 遷移。
+- **Hot key**：QPS **集中**喺同一個 key。熱門交易對嘅 orderbook 可以**又大又熱**，但治理方法唔同：大要拆同分批；熱要本地緩存／多副本 key／限流。只加本地緩存，救唔到 `DEL` 一個幾萬 field 嘅 Hash。
+
+**點定位（唔好 `KEYS *`）**
+
+- 線上：slowlog、單節點 CPU／網卡、Cluster 某節點內存或流量傾斜（一個大 key 只能喺**一個 slot／一個節點**）。
+- `MEMORY USAGE key`、`OBJECT ENCODING`；`redis-cli --bigkeys`（SCAN 抽樣，**每種類型只報元素數最大嗰個**，唔係完整清單，亦唔係按內存）。Redis 7 可用 `--memkeys`。
+- 完整盤點離線分析 RDB（`rdb-tools` 等），避免喺主庫掃描。
+
+**點拆、點讀**
+
+- Hash 按 `hash(field) % N` 拆成 `orderbook:{symbol}:{shard}` 或 `pos:{uid}:{shard}`；List／ZSet 按時間窗或分片拆。Cluster 要令拆出嚟嘅 key 分散到唔同 slot，單個大 key **拆唔開**同一個 slot。
+- 讀用 `HSCAN`／`HMGET` 只拎需要嘅 field，禁止開盤路徑 `HGETALL` 成本帳。
+- 設計期就要限制集合大小；實在大嘅快照唔好放 Redis。
+
+**點刪（呢度最易踩坑）**
+
+- 集合型 `DEL` 係 O(N)，幾萬 field 會卡住主線程，複製緩衝堆積、replica 追唔上，嚴重可以引發切換。
+- 用 `UNLINK`（主線程 O(1) 解除引用，內存由後台釋放）；舊版本用 `HSCAN` + 分批 `HDEL`／`LTRIM`。
+- 開 `lazyfree-lazy-expire`、`lazyfree-lazy-eviction`、`lazyfree-lazy-server-del`，避免過期／淘汰／rename 覆蓋時隱式大刪除。
+- 對帳「整本重建」唔好 `HGETALL` + `DEL`：改分片寫入新 key，再原子切換（rename／指針 key），舊 key 用 `UNLINK`。
+
+### 追問／陷阱
+
+- `--bigkeys` 唔等於「全部大 key 清單」，元素少但 value 好大嘅 String 可能漏報；要配 `--memkeys` 或 RDB 分析。
+- 大 key 刪除引發嘅「主從延遲／切換」，根因往往係主線程阻塞同複製落後，唔係複製本身突然壞。
+- Pipeline 只係減 RTT，**唔會**把一條 `HGETALL`／`DEL` 變成非阻塞。
