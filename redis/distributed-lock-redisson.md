@@ -12,3 +12,7 @@
 ## 追問 / 陷阱
 - 「鎖超時後業務仲寫咗 DB 點算？」→ 鎖只係效率保護，正確性靠冪等鍵或樂觀鎖（version）。
 - 指定 leaseTime 會令 watchdog 失效，GC 長停頓可能令鎖提前過期。
+
+## 關聯
+
+較完整答法見 [distributed/redis-distributed-lock.md](../distributed/redis-distributed-lock.md)（2026-11-21 已補 watchdog／fencing／CEX 取捨）。

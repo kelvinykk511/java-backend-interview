@@ -53,3 +53,54 @@
 ## 關聯
 
 - [介面與消息的冪等](idempotency.md)
+- [Spring @Transactional 失效](../spring/transactional-failure-scenarios.md)
+- [Kafka 消息順序](../kafka-mq/message-ordering.md)
+
+---
+
+## 深入（2026-11-21）：Relay 輪詢 vs CDC、標記時機、同事務陷阱
+
+### 面試可以點追
+
+「`@TransactionalEventListener(AFTER_COMMIT)` 喺 commit 後 `kafkaTemplate.send`，係咪已經夠？同 Outbox 差喺邊？Relay 用輪詢定 Debezium？發完先更新 outbox 定先標 SENT？」
+
+### 答法
+
+**AFTER_COMMIT 發 MQ ≠ Outbox**
+
+- `AFTER_COMMIT`／`TransactionSynchronization.afterCommit` 解決「事務未提交就發、下游查唔到」同「rollback 咗但消息已飛」。
+- **救唔到**：「commit 成功 → 進程 crash／Kafka 短暫不可用 → 呢次 send 永遠唔會再試」。進程重啟後冇「待發清單」。
+- Outbox：待發事件**寫喺庫裡**，同業務同一事務提交；Relay 可以 crash 重試，最終會出。
+
+**輪詢 vs CDC**
+
+| | 輪詢 outbox 表 | CDC（binlog → Debezium 等） |
+|---|---|---|
+| 優點 | 實作簡單、可控批次／退避 | 近實時、少打主庫業務表、天然跟事務提交順序 |
+| 代價 | 週期掃表、要複合索引（`status, id`）、表膨脹要歸檔 | 運維／權限／schema 演進；要處理 snapshot、DDL |
+| CEX 常見 | 中小流量、自建 Relay | 入帳／劃轉等要低延遲、已有 Canal／Debezium |
+
+兩邊都係 **at-least-once**：Relay 發成功但標記失敗會重發 → 下游必須冪等。
+
+**標記時機（容易講錯）**
+
+1. **讀 NEW → send → 標 SENT**（最常見）：send 成功、標 SENT 失敗 → 重發（重複 OK，靠冪等）。
+2. **先標 SENDING 再 send**：避免多個 Relay 搶同一行；要有租約／`locked_by` + 超時回收，否則卡死。
+3. **刪除行**：可以，但排障冇歷史；多數留 SENT + 定期歸檔。
+4. **唔好**「先標 SENT 再 send」：標完 crash、未 send → **丟消息**。
+
+**同事務／傳播陷阱（同昨日 Kafka 順序、雙寫一齊考）**
+
+- 業務 + outbox 必須同一 `REQUIRED` 事務；**唔好**對 outbox 單獨 `REQUIRES_NEW` 而業務回滾 → 幽靈事件。
+- 事務入面直接 `kafkaTemplate.send`（無 outbox）：rollback 後消息可能已出；commit 前發出下游讀未提交。
+- Relay **唔好**同業務請求共用 Tomcat 線程同步狂掃；獨立進程／線程池，失敗有退避同死信指標。
+
+**表設計最少欄位（面試可講）**
+
+`id`, `aggregate_type`, `aggregate_id`（如 `depositId`）, `event_type`, `payload`（JSON）, `status`（NEW/SENT/DEAD）, `created_at`, `sent_at`, `retry_count`；可選 `trace_id`。唯一約束可放 `(aggregate_id, event_type)` 防業務重複插入。
+
+### 追問／陷阱
+
+- 「開咗 Kafka 冪等 producer／EOS 就唔使 Outbox？」→ 否。EOS 管 broker 側重複同讀未提交；**管唔到**「DB 成功但應用根本冇再 send」。
+- 「只用 Canal 訂業務表、唔寫 outbox？」→ 可以當「隱式 outbox」，但要把「可發佈事件」同表變更語義對齊（唔好把中間狀態當最終事件），並處理 schema／多表拼裝。
+- Relay 同 key 亂序：Outbox 按 `id` 遞增發，通常近似提交序；跨分區仍無序，下游要版本號／狀態機（見 [消息順序](../kafka-mq/message-ordering.md)）。
