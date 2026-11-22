@@ -21,11 +21,22 @@
 
 ## 常見追問／陷阱
 
-- 「JDK7 點做？」Segment 分段鎖（繼承 ReentrantLock），併發度固定 = segment 數；JDK8 改為桶級鎖 + CAS，粒度更細。
+- 「JDK7 點做？」Segment 分段鎖（繼承 ReentrantLock），併發度固定 = segment 數；JDK8 改為桶級鎖 + CAS，粒度更細。JDK8 構造參數 `concurrencyLevel` 只係容量提示，唔再係分段數。
 - 「`size()` 準唔準？」係**估算**：併發寫緊時只係某一刻的近似值。要準確計數就自己維護。
 - 「`get` 要唔要鎖？」唔使。`Node.val`、`next` 係 `volatile`，table 讀用 `Unsafe.getObjectVolatile`。
 - 陷阱：`if (!map.containsKey(k)) map.put(k, v)` 唔係原子操作，要用 `putIfAbsent` / `computeIfAbsent`。
 - 陷阱：`computeIfAbsent` 入面再改同一個 map（尤其同一個桶）可能死循環/拋 `IllegalStateException`（JDK8 有 bug，JDK9 改為報錯）。
+- 陷阱：用無界 CHM 做本地緩存／去重表，key 唔淘汰就會一直脹堆。進程內 map 亦**唔係**跨實例冪等；下單去重要落 DB 唯一鍵。
+
+## 深入：sizeCtl、協助擴容、compute 陷阱（2026-11-22 refresh）
+
+**面試可以再問**：多線程同時 put 觸發擴容時點協作？點解 `containsKey` + `put` 會重複下單？
+
+- **`sizeCtl`**：`0` 未初始化；`-1` 有人正在 `initTable`；負值且絕對值 >1 時表示正在 transfer（入面編碼咗 stamp 同參與搬遷嘅 worker 數）；正值係下次擴容閾值（大約容量 × 0.75）。
+- **協助搬遷**：某個寫線程建 2 倍新表之後，其他寫入撞到 ForwardingNode 或發現正在 resize，會按 `transferIndex` 分段（stride）搬桶。已搬嘅桶掛 ForwardingNode，讀寫都去新表。唔係單一線程搬整張表。
+- **`containsKey` 再 `put`**：兩條線程可以同時見到「冇呢個 key」，然後各自 `put`——後 put 覆蓋先 put，但兩邊都以為自己係第一次，業務就跑咗兩次。要用 `putIfAbsent`／`computeIfAbsent` 一次過，而且只係**單進程**互斥。
+- **`computeIfAbsent`**：mapping function 應係純計算；入面再 `put` 同一個 map，JDK 8 可能喺同一桶上重入 `synchronized` 或形成環，JDK 9+ 較多直接丟 `IllegalStateException`。相關 key 嘅寫要放喺 function 外面，或合併成一次 `compute`。
+- CHM 適合進程內高併發字典，唔適合當分佈式鎖或跨實例去重。
 
 ## 相關
 
