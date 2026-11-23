@@ -53,3 +53,19 @@
 ## 小練習
 
 批次入帳 100 筆，第 37 筆校驗失敗要跳過並記錯，其餘要提交。選 `REQUIRES_NEW` 還是 `NESTED`？外層最後若整批回滾，兩種結果差在哪？Outbox 跟業務寫入該不該拆成 `REQUIRES_NEW`？
+
+## 深入：catch 之後同 rollback-only（2026-11-23 warm-up）
+
+**面試題**：外層 `REQUIRED` 調另一個 Bean 嘅 `REQUIRED` 方法，內層拋 `RuntimeException`，外層 catch 住當成功 return，會點？失敗審計用 `REQUIRES_NEW`、outbox 用 `REQUIRES_NEW`，分別啱唔啱？
+
+- **同一條事務已被標 `rollback-only`**。內層 `REQUIRED` 加入外層事務，拋出 `RuntimeException`／`Error`（默認）就會標回滾。外層就算 catch 住、唔 rethrow，提交階段一樣會丟 **`UnexpectedRollbackException`**，整單回滾。呼叫方若只看自己「已經 handle」，會誤以為成功。
+- **喺同一個 `REQUIRED` 裡寫失敗記錄**：記錄同主單一齊回滾，最後連痕跡都冇。
+- **內層改 `REQUIRES_NEW`**（必須經代理、另一個 Bean 或 `AopContext`）：內層係獨立事務，回滾**唔會**標花外層。異常仍然會拋出；外層 catch 住就可以提交自己嗰段。呢個先係「成敗解耦」。代價係外層未結束時會**多佔一條 DB 連線**，同出現「內層已提交、外層未定」嘅窗口。
+- **失敗審計／嘗試次數**用 `REQUIRES_NEW` 啱（主單回滾都要留痕）。**Outbox 唔可以**：事件同業務必須同一 `REQUIRED`，否則業務回滾仍會留下待打款事件。見 [Transactional Outbox](../distributed/transactional-outbox.md)。
+- **自調用**：`this.logFailure()` 就算標咗 `REQUIRES_NEW` 都唔開新事務，行為同普通方法，記錄會跟外層一齊沒。
+
+### 追問／陷阱
+
+- 「catch 住就當提交成功」✗。`REQUIRED` 參與者拋 unchecked，外層再 succeed 都提交唔到。要跳過某段，用 `NESTED`（savepoint）或獨立 `REQUIRES_NEW`，而且要想清楚已提交部分回唔回得轉。
+- 默認只對 **RuntimeException／Error** 回滾；checked exception 要自己寫 `rollbackFor`。
+- 唔好喺事務方法裡面隨便 catch 住所有異常又唔 rethrow——要麼讓事務框架處理，要麼好清楚呢次係「仍然提交」定「一定回滾」。

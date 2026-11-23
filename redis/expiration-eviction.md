@@ -38,3 +38,20 @@
 
 - **淘汰會不會刪掉分布式鎖的 key？** `allkeys-*` 下會 → 鎖提前消失，兩個人同時拿到鎖。所以鎖不要和大緩存放同一個 allkeys 實例，且業務層仍要冪等。
 - **怎麼監控？** `INFO stats` 的 `evicted_keys`、`expired_keys`；`used_memory` vs `maxmemory`；`evicted_keys` 持續增長 = 容量不夠或有大 key。
+
+## 深入：miss 係過期定淘汰（2026-11-23 warm-up）
+
+**面試題**：訂單緩存突然大面積 miss，有人話 TTL 到咗；但 `evicted_keys` 急升、`expired_keys` 正常，出金鎖又偶發提早消失。你點判斷？policy 點配？
+
+- **先分兩條計數**。`INFO stats` 嘅 **`expired_keys`** 係 TTL 到期被刪；**`evicted_keys`** 係用量超過 `maxmemory`，按 `maxmemory-policy` 趕走——**未過期都會刪**。呢題係淘汰，唔係到期。
+- **排查順序**：`used_memory` 對 `maxmemory`、`evicted_keys`／`expired_keys` 增速、有冇大 key、fork／COW 有冇再抬高內存。miss 唔等於「EX 到咗」。
+- **`allkeys-lru`／`allkeys-lfu`** 會淘汰**所有** key，包括出金鎖、限流計數。鎖提早沒 → 另一台攞到鎖，重複出金。鎖同大緩存**分實例**；業務層仍然要有唯一鍵／狀態機，唔好當 Redis 鎖係正確性保證。
+- **改 `volatile-lru` 唔等於鎖安全**：`volatile-*` 只喺**設咗 TTL** 嘅 key 裡挑，`SET NX PX` 嘅鎖正在呢個集合，一樣會被淘汰。它保住嘅係**冇 TTL** 嘅資料（例如常駐配置）。
+- **`volatile-*` + 大量無 TTL key**：可淘汰嘅集合太細，釋放唔到 `maxmemory` 以下，寫入報 `OOM command not allowed`，行為接近 `noeviction`。
+- **過期但內存仍高**：讀唔到係準時嘅（惰性刪），內存釋放靠定期抽樣，冷嘅過期 key 會滯留。可對照 `expired_keys` 同內存用量；必要時 `lazyfree-lazy-expire`／`lazyfree-lazy-eviction`（非同步釋放大對象，唔等於唔使淘汰）。
+- **純緩存**：`allkeys-lfu`（或 lru）+ 每個 key 都有 TTL（加抖動）；`maxmemory` 一定要設，並預留 fork 嘅 COW。持久資料同鎖分開實例。
+
+### 追問
+
+- 從庫預設跟主庫刪除（`replica-ignore-maxmemory` 預設 yes），唔好假設從庫會獨立按 `maxmemory` 淘汰。
+- LRU／LFU 係抽樣近似，唔係精確鏈表；一次大掃描可以擠走熱 key，LFU 會好啲但仍要監控 `evicted_keys`。
