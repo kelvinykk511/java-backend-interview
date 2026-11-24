@@ -51,3 +51,20 @@
 ## 小練習
 
 表有索引 `(status, created_at)`，查 `SELECT id, status FROM t WHERE status=1 ORDER BY created_at LIMIT 20`。算不算覆蓋？要不要改成 `(status, created_at, id)`？為什麼？
+
+
+## 深入：InnoDB 隱式主鍵同「加多一列先算覆蓋」（2026-11-24 warm-up）
+
+**面試題**：表主鍵係 `id`，已有 `(user_id, created_at)`。`SELECT id, user_id, created_at FROM orders WHERE user_id=? ORDER BY created_at LIMIT 20` 算唔算覆蓋？要唔要再加一列 `id`？同 `Using index condition` 點分？
+
+- **InnoDB 二級索引葉子已經帶主鍵**。`(user_id, created_at)` 實際等同 `(user_id, created_at, id)`（PK 在尾）。上面呢條查詢需要嘅列都在索引裡，而且 `user_id` 等值 + `created_at` 有序，通常已經係 **`Using index`**，**唔使再把 `id` 加一次**。
+- 若 `SELECT` 多要 `amount` 等未包含嘅列，先會回表；呢時先考慮把穩定、常被讀、少更新嘅列加喺索引尾巴。`SELECT *` 幾乎一定回表，覆蓋直接被殺死。
+- **唔好為咗「帶上 id」亂建 `(user_id, id, amount)`**。最左前綴變成 `user_id, id`，對 `WHERE user_id=? AND status=?` 或 `ORDER BY created_at` 用唔到後續列，優化器可能根本唔揀呢條索引。
+- **前綴索引不能覆蓋該列**：`INDEX(user_id, created_at(10))` 只存前綴，唔能單靠索引交出完整 `created_at`，就算 EXPLAIN 用咗呢條索引都要回表。
+- 再分一次：**`Using index` = 覆蓋、唔回表**；**`Using index condition` = ICP**，索引層先過濾，**仍然可能回表**。兩者可以同時出現，但語意唔同。
+- 用 `EXPLAIN`（必要時 `EXPLAIN ANALYZE`）驗證，唔好假設「建咗覆蓋索引就一定用」。選擇性差、統計過期、或排序／分組用唔上最左前綴，優化器會放棄。索引越寬，寫入同緩衝池壓力越大，只為偶發查詢加很寬嘅覆蓋通常唔划算。
+
+### 追問
+
+- 「主鍵索引本身算唔算覆蓋？」聚簇索引葉子已經係整行，面試講覆蓋通常係指**二級索引能否免回表**。
+- `COUNT(*)` 有時可以只掃一條較窄嘅二級索引（依然係 index-only），呢個係覆蓋思維，但優化器亦可能揀另一條更細嘅索引。
