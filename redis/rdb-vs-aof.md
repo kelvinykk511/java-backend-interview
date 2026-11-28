@@ -73,3 +73,43 @@ CEX 熱路徑餘額若幾乎不能丟，你會偏 RDB、AOF，還是兩者 + 別
 ### 注意
 
 - 持久化 **≠ 唔丟數據**；主從異步複製 + failover 仍可能丟 → 見 [主從複製](master-replica-replication.md)（如存在）。
+
+## 深入：空主庫洗從庫、MISCONF、rewrite 期間唔 fsync（2026-11-28 warm-up）
+
+**面試題**：熱數據 Redis 已開 RDB + AOF `everysec`，點解重啟後仍然可能丟數據，甚至把從庫一齊清空？磁碟滿時寫入又會點？
+
+### 持久化解決咩、解決唔到咩
+
+- 持久化答嘅係「**呢個進程掛咗，磁碟仲有冇數據**」。主從複製預設**異步**，failover 仍可能丟已寫但未傳到從庫嘅數據。兩者唔可以互相替代。
+- `appendfsync everysec`（預設）官方都講災難時可能丟約 **1 秒**；上次 fsync 超過約 2 秒未完成時，主線程 `write` 會阻塞，窗口同延遲都會變差。`always` 最安全但慢；`no` 交 OS，Linux 常見約 30 秒級風險。
+- 有開 AOF → 重啟**優先載 AOF**（混合持久化時 base 係 RDB 格式 + 後面增量 AOF）。全量同步從庫用嘅係 **RDB 快照**（或 diskless 直接在線上傳 RDB），**唔係重放 AOF**。
+
+### 經典事故：主庫空數據集洗走全部從庫
+
+官方有專門一節（*Safety of replication when master has persistence turned off*）：
+
+1. 主庫 A **關持久化**（`save ""` 且 `appendonly no`，或磁碟故障後被人關咗 AOF）；
+2. 進程有 **systemd／自動重啟**，crash 後帶住**空數據集**起來；
+3. 從庫 B、C 重新全量同步呢個空庫 → **自己原本嘅數據一齊被清**。
+
+Sentinel 下如果主庫重啟夠快、未被判故障，一樣會中招。官方建議：要安全就**主從都開持久化**；若主庫為咗延遲真係唔落盤，就**禁止自動重啟**，唔好假設「從庫有 AOF 就能保住」。
+
+### 磁碟滿：`MISCONF` 同 `stop-writes-on-bgsave-error`
+
+- `stop-writes-on-bgsave-error` **預設 yes**：上次 `BGSAVE` 失敗（常見磁碟滿），Redis **拒絕寫入**，客戶端見到 `MISCONF Redis is configured to save RDB snapshots, but it's currently unable to persist to disk`。讀通常仍可用。
+- 正確做法：清磁碟、修權限、確認 `INFO persistence`／log，等一次成功嘅 BGSAVE。**唔好**為咗恢復寫入就改 `no`——快照一直壞，下次掛先至發現丟咗一段。
+- AOF 寫唔入同樣會拒寫（例如 `No space left on device`）。
+
+### `no-appendfsync-on-rewrite`
+
+- 設 `yes` 時，AOF rewrite／`BGSAVE` 期間主進程**跳過 AOF fsync**，避免同子進程搶盤。代價係丟數據窗口可以拉長到**成段重寫期間**（其間只靠 OS 刷盤，Linux 下甚至幾十秒級）。呢個唔係免費加速，要數據安全就保持預設 `no`。
+
+### 運維同賬本邊界
+
+- 大實例 fork（複製頁表）同重啟 **loading** 會阻塞；loading 期間健康檢查失敗，可能被當成掛咗再 failover，來回抖。
+- 交易所**賬本／餘額／凍結**唔可以只靠 Redis 持久化：要以 DB + binlog 為準，Redis 要有從 DB **重建**嘅路徑。持久化只係縮短恢復時間，唔係真相來源。
+
+### 追問／陷阱
+
+- 「RDB + AOF 都開 = 唔會丟」——`everysec`、異步複製、rewrite 關 fsync、空主庫重啟，都可以丟甚至清叢集。
+- 只喺從庫做持久化、主庫關持久化再開自動重啟，係官方點名嘅危險組合。

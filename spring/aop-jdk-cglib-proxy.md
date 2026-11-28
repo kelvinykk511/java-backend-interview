@@ -68,3 +68,36 @@ Spring AOP 預設用哪種代理？什麼情況下會換成 CGLIB？自呼叫（
 
 - `AopUtils.isAopProxy`／`isJdkDynamicProxy`／`isCglibProxy`。
 - `getClass()` 見 `$$SpringCGLIB$$`（Spring 6）或 `$Proxy`。
+
+## 深入：切面順序、鎖同事務、@Async 疊加（2026-11-28 warm-up）
+
+**面試題**：同一個方法或一條呼叫鏈上同時有自定義分布式鎖切面、`@Transactional`、`@Async`，代理同執行順序會出咩問題？仲有邊啲情況注解會靜默失效？
+
+### 先分清「攔唔到」同「攔到但順序錯」
+
+- Spring AOP（proxy mode）只攔**經代理嘅外部呼叫**。以下會**靜默唔生效**（唔報錯）：
+  - 同類 `this.foo()`（最常見）；
+  - `@PostConstruct`／初始化階段就調業務方法（代理未必已就緒）；
+  - **非 public** 方法上嘅 `@Transactional`（官方：proxy mode 只處理 public）；
+  - `final` 類／方法（CGLIB 覆寫唔到）；Kotlin 類默認 `final`，要 all-open。
+- 注入到嘅係代理，唔係 target。排查用 `AopUtils.isAopProxy`，以及 `getClass()` 係 `$$SpringCGLIB$$` 定 `$Proxy`。
+
+### 切面順序
+
+- 呼叫進入時，**外層切面先執行、後結束**（像洋蔥）。`@Order`／`Ordered` **數字愈細愈靠外**。
+- `@Transactional` 預設 `Ordered.LOWEST_PRECEDENCE`，貼近業務方法（較內）。
+- **分布式鎖應該在外、事務在內**：先攞鎖 → 開事務 → 業務 → commit → 放鎖。其他線程喺 commit 前攞唔到鎖，唔會按舊快照去寫。
+- **相反（事務在外、鎖在內）**：等鎖期間佔住 DB 連線；放鎖之後事務可能仲未 commit，另一條線程攞到鎖會讀到舊數據再寫 → 超賣／重複扣。鎖粒度同事務邊界要對齊。
+
+### `@Async` + `@Transactional`
+
+- `AsyncAnnotationBeanPostProcessor` 預設 **`beforeExistingAdvisors=true`**，把 async advisor **插到現有鏈最前面**（最外）：先交去線程池，**喺 worker 線程**先至開事務。呢個先後通常先係啱嘅。
+- 唔好自行把事務切面調到比 Async **更外**：否則呼叫線程開咗事務，`@Async` 立即返回，外層事務提早 commit；真正工作喺池入面跑，`TransactionSynchronizationManager` 呢類 ThreadLocal **帶唔走**。
+- 實務：**唔好同一個方法同時標 `@Async` + `@Transactional`**。拆 Bean：請求線程走同步事務方法；發 MQ／通知用 `TransactionSynchronization.afterCommit`，或者另一個 Bean 嘅 `@Async`。
+- `AopContext.currentProxy()`（要 `spring.aop.expose-proxy=true`）綁喺當前線程，**換線程之後唔能再用**。
+
+### 追問／陷阱
+
+- 以為加咗 `@Transactional`／`@DistributedLock` 就一定生效——自調用、非 public、`final` 都會靜默失效。
+- 鎖同事務 `@Order` 寫反，高併發先爆。
+- `@Async` 方法 `void` 嘅例外預設只入 `AsyncUncaughtExceptionHandler`，呼叫方捉唔到，唔好當成事務回滾已通知到上游。
